@@ -4,18 +4,26 @@ import { vmget } from './vmpay.js';
 
 const router = express.Router();
 
-function ok(res, data) { return res.status(200).json(data); }
-function safeFail(res, err, fallback) {
+const ok = (res, data) => res.status(200).json(data);
+const safeFail = (res, err, fallback) => {
   console.error('[API ERROR]', err?.message || err);
   const status = err?.status || err?.response?.status || 500;
   if (fallback !== undefined) return res.status(200).json(fallback);
   return res.status(status).json({ error: err?.message || 'Erro inesperado' });
+};
+
+// util para pegar o primeiro valor não vazio
+function firstNonEmpty(list, fallback = '') {
+  for (const v of list) {
+    if (v !== undefined && v !== null && String(v).trim() !== '') return v;
+  }
+  return fallback;
 }
 
-// saúde (teste rápido)
+// ---------------------- saúde ----------------------
 router.get('/health', (_req, res) => ok(res, { ok: true }));
 
-// autenticação
+// ---------------------- auth ----------------------
 router.post('/auth', async (req, res) => {
   const { email = '', senha = '' } = req.body || {};
   try {
@@ -34,7 +42,7 @@ router.post('/auth', async (req, res) => {
   return ok(res, { id: 1, nome: 'ESTOQUE POA', email: email || 'estoque.poa@gelb.com.br' });
 });
 
-// picklists concluídas (MySQL) — tolerante a falhas
+// --------- picklists concluídas (MySQL, tolerante) ---------
 router.get('/completedPicklists', async (req, res) => {
   const operadorId = Number(req.query.operadorId || 0);
   if (!operadorId) return ok(res, []);
@@ -46,49 +54,76 @@ router.get('/completedPicklists', async (req, res) => {
     );
     return ok(res, rows.map(r => String(r.picklist_id)));
   } catch (e) {
-    return safeFail(res, e, []); // se der erro de DB, devolve lista vazia
+    return safeFail(res, e, []); // em erro, devolve lista vazia
   }
 });
 
-// agendas (rotas) — VMpay
+// ---------------------- agendas (rotas) ----------------------
+// tenta vários campos possíveis para id e nome
 router.get('/agendas', async (req, res) => {
   const { start_date = '', end_date = '' } = req.query;
   try {
-    const data = await vmget(
+    const raw = await vmget(
       `scheduled_visits?start_date=${encodeURIComponent(start_date)}&end_date=${encodeURIComponent(end_date)}`
     );
-    const rotas = Array.isArray(data)
-      ? data.map((r, i) => ({
-          id: r.id || r.route_id || i + 1,
-          name: r.name || r.route_name || r.title || `Rota ${r.id || i + 1}`
-        }))
-      : [];
+    const arr = Array.isArray(raw) ? raw : Array.isArray(raw?.data) ? raw.data : [];
+
+    const rotas = arr.map((r, i) => {
+      const id = firstNonEmpty([
+        r.route_id, r.id, r.route?.id, r.code, r.number, i + 1
+      ]);
+      const name = firstNonEmpty([
+        r.route_name,
+        r.name,
+        r.title,
+        r.description,
+        r.label,
+        r.route?.name,
+        r.route?.title,
+        `Rota ${id}`
+      ]);
+      return { id: String(id), name: String(name) };
+    });
+
     return ok(res, rotas);
   } catch (e) {
     return safeFail(res, e, []);
   }
 });
 
-// picklists por rota — VMpay
+// ---------------------- picklists ----------------------
+// idem: tenta diversos campos para id e nome
 router.get('/picklists', async (req, res) => {
   const { rota = '', start_date = '', end_date = '' } = req.query;
   try {
-    const data = await vmget(
+    const raw = await vmget(
       `pick_lists?route_id=${encodeURIComponent(rota)}&start_date=${encodeURIComponent(start_date)}&end_date=${encodeURIComponent(end_date)}`
     );
-    const pls = Array.isArray(data)
-      ? data.map(p => ({
-          id: String(p.id ?? p.pick_list_id ?? p.code ?? ''),
-          nome: p.name || p.title || p.code || `Picklist ${p.id}`
-        }))
-      : [];
+    const arr = Array.isArray(raw) ? raw : Array.isArray(raw?.data) ? raw.data : [];
+
+    const pls = arr.map((p) => {
+      const id = firstNonEmpty([
+        p.id, p.pick_list_id, p.code, p.number, p.uid, p.uuid
+      ]);
+      const nome = firstNonEmpty([
+        p.name,
+        p.title,
+        p.display_name,
+        p.description,
+        p.code,
+        p.pick_list?.name,
+        `Picklist ${id}`
+      ]);
+      return { id: String(id), nome: String(nome) };
+    });
+
     return ok(res, pls);
   } catch (e) {
     return safeFail(res, e, []);
   }
 });
 
-// itens de uma picklist — VMpay (404 vira [])
+// ---------------------- itens ----------------------
 router.get('/items', async (req, res) => {
   const picklistId = String(req.query.picklistId || '');
   if (!picklistId) return ok(res, []);
@@ -96,13 +131,9 @@ router.get('/items', async (req, res) => {
     const det = await vmget(`pick_lists/${encodeURIComponent(picklistId)}`);
     const start = det?.created_at || '';
     const updated = det?.updated_at || '';
-    let end;
-    if (updated && updated !== start) {
-      const dt = new Date(updated);
-      end = new Date(dt.getTime() + 1000).toISOString();
-    } else {
-      end = new Date().toISOString();
-    }
+    const end = updated && updated !== start
+      ? new Date(new Date(updated).getTime() + 1000).toISOString()
+      : new Date().toISOString();
 
     let page = 1, perPage = 100, out = [];
     while (true) {
@@ -135,7 +166,7 @@ router.get('/items', async (req, res) => {
   }
 });
 
-// marcar picklist como concluída — tolerante a falha de DB
+// ---------------------- concluir picklist ----------------------
 router.post('/completePicklist', async (req, res) => {
   const { operadorId, picklistId } = req.body || {};
   if (!operadorId || !picklistId) return res.status(400).json({ error: 'Dados insuficientes' });
@@ -147,7 +178,6 @@ router.post('/completePicklist', async (req, res) => {
     );
     return ok(res, { ok: true });
   } catch (e) {
-    // não trava a operação se o banco remoto estiver indisponível
     return safeFail(res, e, { ok: true });
   }
 });
