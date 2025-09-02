@@ -7,6 +7,7 @@ const app = express();
 const PORT = process.env.PORT || 8080;
 
 app.use(cors({ origin: '*' }));
+app.options('*', cors()); // habilita respostas ao preflight (OPTIONS)
 app.use(express.json());
 
 // todas as rotas da API ficam em /api/...
