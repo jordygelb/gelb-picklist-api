@@ -1,7 +1,7 @@
-// servidor mínimo só pra validar deploy (vamos adicionar as rotas depois)
 import 'dotenv/config';
 import express from 'express';
 import cors from 'cors';
+import router from './routes.js';
 
 const app = express();
 const PORT = process.env.PORT || 8080;
@@ -9,8 +9,8 @@ const PORT = process.env.PORT || 8080;
 app.use(cors({ origin: '*' }));
 app.use(express.json());
 
-// endpoint de saúde para testes
-app.get('/api/health', (_req, res) => res.json({ ok: true }));
+// todas as rotas da API ficam em /api/...
+app.use('/api', router);
 
 // fallback 404
 app.use((_req, res) => res.status(404).json({ error: 'Not Found' }));
