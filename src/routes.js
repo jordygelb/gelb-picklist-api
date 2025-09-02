@@ -12,7 +12,6 @@ const safeFail = (res, err, fallback) => {
   return res.status(status).json({ error: err?.message || 'Erro inesperado' });
 };
 
-// util para pegar o primeiro valor não vazio
 function firstNonEmpty(list, fallback = '') {
   for (const v of list) {
     if (v !== undefined && v !== null && String(v).trim() !== '') return v;
@@ -42,7 +41,7 @@ router.post('/auth', async (req, res) => {
   return ok(res, { id: 1, nome: 'ESTOQUE POA', email: email || 'estoque.poa@gelb.com.br' });
 });
 
-// --------- picklists concluídas (MySQL, tolerante) ---------
+// --------- picklists concluídas (tolerante) ---------
 router.get('/completedPicklists', async (req, res) => {
   const operadorId = Number(req.query.operadorId || 0);
   if (!operadorId) return ok(res, []);
@@ -54,37 +53,56 @@ router.get('/completedPicklists', async (req, res) => {
     );
     return ok(res, rows.map(r => String(r.picklist_id)));
   } catch (e) {
-    return safeFail(res, e, []); // em erro, devolve lista vazia
+    return safeFail(res, e, []); // em erro, retorna vazio
   }
 });
 
 // ---------------------- agendas (rotas) ----------------------
-// tenta vários campos possíveis para id e nome
+// Reproduz a lógica do PHP: obtém IDs pelas scheduled_visits e
+// busca o name em routes/{id}. Usa apenas nomes que começam com "ROTA ".
 router.get('/agendas', async (req, res) => {
   const { start_date = '', end_date = '' } = req.query;
   try {
-    const raw = await vmget(
+    // nomes "ROTA ..." observados em pick_lists (ajuda no fallback)
+    let rotaNames = new Set();
+    try {
+      const pls = await vmget(
+        `pick_lists?include=routes&pending_only=true&start_date=${encodeURIComponent(start_date)}&end_date=${encodeURIComponent(end_date)}`
+      );
+      for (const p of (Array.isArray(pls) ? pls : [])) {
+        for (const r of (p.routes || [])) {
+          const n = r?.name || '';
+          if (n.toUpperCase().startsWith('ROTA ')) rotaNames.add(n);
+        }
+      }
+    } catch {}
+
+    // ids vindo das visitas agendadas
+    const vis = await vmget(
       `scheduled_visits?start_date=${encodeURIComponent(start_date)}&end_date=${encodeURIComponent(end_date)}`
     );
-    const arr = Array.isArray(raw) ? raw : Array.isArray(raw?.data) ? raw.data : [];
+    const idsSet = new Set();
+    for (const v of (Array.isArray(vis) ? vis : [])) {
+      for (const svr of (v.scheduled_visit_routes || [])) {
+        if (svr?.route_id) idsSet.add(svr.route_id);
+      }
+    }
 
-    const rotas = arr.map((r, i) => {
-      const id = firstNonEmpty([
-        r.route_id, r.id, r.route?.id, r.code, r.number, i + 1
-      ]);
-      const name = firstNonEmpty([
-        r.route_name,
-        r.name,
-        r.title,
-        r.description,
-        r.label,
-        r.route?.name,
-        r.route?.title,
-        `Rota ${id}`
-      ]);
-      return { id: String(id), name: String(name) };
-    });
+    const rotas = [];
+    for (const rid of Array.from(idsSet)) {
+      try {
+        const routeObj = await vmget(`routes/${encodeURIComponent(rid)}`);
+        const nameApi = routeObj?.name || '';
+        const name = (nameApi && nameApi.toUpperCase().startsWith('ROTA '))
+          ? nameApi
+          : (rotaNames.size ? [...rotaNames][0] : `Rota ${rid}`);
+        rotas.push({ id: String(rid), name: String(name) });
+      } catch {
+        rotas.push({ id: String(rid), name: `Rota ${rid}` });
+      }
+    }
 
+    rotas.sort((a,b) => String(a.name).localeCompare(String(b.name), 'pt-BR'));
     return ok(res, rotas);
   } catch (e) {
     return safeFail(res, e, []);
@@ -92,32 +110,35 @@ router.get('/agendas', async (req, res) => {
 });
 
 // ---------------------- picklists ----------------------
-// idem: tenta diversos campos para id e nome
+// Nome = p.name || asset_number da máquina || p.asset_number || "Picklist {id}"
 router.get('/picklists', async (req, res) => {
   const { rota = '', start_date = '', end_date = '' } = req.query;
   try {
-    const raw = await vmget(
-      `pick_lists?route_id=${encodeURIComponent(rota)}&start_date=${encodeURIComponent(start_date)}&end_date=${encodeURIComponent(end_date)}`
+    if (!rota) return ok(res, []);
+
+    const pls = await vmget(
+      `pick_lists?include=routes&pending_only=true&start_date=${encodeURIComponent(start_date)}&end_date=${encodeURIComponent(end_date)}`
     );
-    const arr = Array.isArray(raw) ? raw : Array.isArray(raw?.data) ? raw.data : [];
 
-    const pls = arr.map((p) => {
-      const id = firstNonEmpty([
-        p.id, p.pick_list_id, p.code, p.number, p.uid, p.uuid
-      ]);
-      const nome = firstNonEmpty([
-        p.name,
-        p.title,
-        p.display_name,
-        p.description,
-        p.code,
-        p.pick_list?.name,
-        `Picklist ${id}`
-      ]);
-      return { id: String(id), nome: String(nome) };
-    });
+    const machines = await vmget('machines').catch(() => []);
+    const mapM = new Map();
+    for (const m of (Array.isArray(machines) ? machines : [])) {
+      mapM.set(m.id, m.asset_number || '');
+    }
 
-    return ok(res, pls);
+    const out = [];
+    for (const p of (Array.isArray(pls) ? pls : [])) {
+      const routes = p.routes || [];
+      const matchesRota = routes.some(r => String(r.id) === String(rota));
+      if (!matchesRota) continue;
+
+      const nomePick = p.name || '';
+      const mid      = p.machine_id || null;
+      const label    = firstNonEmpty([nomePick, mapM.get(mid), p.asset_number, `Picklist ${p.id}`]);
+      out.push({ id: String(p.id), nome: String(label) });
+    }
+
+    return ok(res, out);
   } catch (e) {
     return safeFail(res, e, []);
   }
